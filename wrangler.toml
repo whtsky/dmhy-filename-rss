@@ -1,0 +1,8 @@
+name = "dmhy-filename-rss"
+main = "index.ts"
+compatibility_date = "2026-01-20"
+
+[observability]
+[observability.logs]
+enabled = true
+invocation_logs = true
