@@ -1,5 +1,4 @@
-import { XMLParser } from 'fast-xml-parser'
-import { parseHTML } from 'linkedom'
+import { Parser } from 'htmlparser2'
 
 // ================= 配置区域 =================
 const RSS_URL = 'https://share.dmhy.org/topics/rss/rss.xml'
@@ -35,15 +34,8 @@ interface RSSChannel {
   title?: string
   link?: string
   description?: string
-  item: RSSItem | RSSItem[]
+  item?: RSSItem | RSSItem[]
   [key: string]: unknown
-}
-
-interface RSSObject {
-  rss: {
-    channel: RSSChannel
-    [key: string]: unknown
-  }
 }
 
 function escapeXml(text: string): string {
@@ -130,6 +122,87 @@ async function fetchRssText(cache: Cache, ctx: ExecutionContext): Promise<{ text
   return { text }
 }
 
+function parseRssWithSax(xmlText: string, cutoffTime: number): { channel: RSSChannel; items: RSSItem[] } {
+  const channel: RSSChannel = { title: '', link: '', description: '' }
+  const items: RSSItem[] = []
+
+  let inChannel = false
+  let inItem = false
+  let textBuf = ''
+  let currentItem: RSSItem | null = null
+  let stopped = false
+
+  const parser = new Parser(
+    {
+      onopentag(name, attribs) {
+        if (stopped) return
+        textBuf = ''
+
+        if (name === 'channel') {
+          inChannel = true
+        } else if (name === 'item') {
+          inItem = true
+          currentItem = { title: '', link: '', pubDate: '' }
+        } else if (inItem && name === 'enclosure') {
+          if (currentItem) {
+            currentItem.enclosure = {
+              '@_url': attribs.url,
+              '@_type': attribs.type,
+              '@_length': attribs.length,
+            }
+          }
+        }
+      },
+      ontext(text) {
+        if (stopped) return
+        textBuf += text
+      },
+      onclosetag(name) {
+        if (stopped) return
+
+        if (inItem) {
+          if (name === 'item') {
+            inItem = false
+            if (currentItem) {
+              const pubTime = new Date(currentItem.pubDate || '').getTime()
+              // DMHY 条目按时间降序排列，遇到超过时间窗口即直接终止解析
+              if (!isNaN(pubTime) && pubTime < cutoffTime) {
+                stopped = true
+                parser.pause()
+                return
+              }
+              items.push(currentItem)
+            }
+            currentItem = null
+          } else if (currentItem) {
+            if (name === 'title') currentItem.title = textBuf.trim()
+            else if (name === 'link') currentItem.link = textBuf.trim()
+            else if (name === 'pubDate') currentItem.pubDate = textBuf.trim()
+            else if (name === 'description') currentItem.description = textBuf.trim()
+            else if (name === 'author') currentItem.author = textBuf.trim()
+            else if (name === 'guid') currentItem.guid = textBuf.trim()
+          }
+        } else if (inChannel) {
+          if (name === 'title') channel.title = textBuf.trim()
+          else if (name === 'link') channel.link = textBuf.trim()
+          else if (name === 'description') channel.description = textBuf.trim()
+          else if (name === 'channel') inChannel = false
+        }
+      },
+    },
+    { xmlMode: true, decodeEntities: true },
+  )
+
+  const chunkSize = 8192
+  for (let i = 0; i < xmlText.length; i += chunkSize) {
+    if (stopped) break
+    parser.write(xmlText.slice(i, i + chunkSize))
+  }
+  parser.end()
+
+  return { channel, items }
+}
+
 async function fetchFilenameWithCache(link: string, cache: Cache, ctx: ExecutionContext): Promise<string | null> {
   const normalizedLink = link.replace(/^http:/, 'https:')
   const cacheKey = new Request(normalizedLink, { method: 'GET' })
@@ -185,23 +258,11 @@ export default {
     const rssResult = await fetchRssText(cache, ctx)
     if ('error' in rssResult) return rssResult.error
 
-    // 2. 解析 XML
-    const parser = new XMLParser({
-      ignoreAttributes: false,
-      preserveOrder: false,
-      parseTagValue: true,
-      trimValues: true,
-    })
-    const rssObj = parser.parse(rssResult.text) as RSSObject
-
-    let items = rssObj.rss.channel.item
-    if (!Array.isArray(items)) items = [items]
-
-    // 3. 时间过滤
+    // 2. 流式 SAX 解析 RSS（并在到达时间窗口时即时退出）
     const cutoffTime = Date.now() - TIME_WINDOW_HOURS * 60 * 60 * 1000
-    const recentItems = items.filter((item) => new Date(item.pubDate).getTime() >= cutoffTime)
+    const { channel, items: recentItems } = parseRssWithSax(rssResult.text, cutoffTime)
 
-    // 4. 并发获取文件名，只保留成功获取的 item
+    // 3. 并发获取文件名，只保留成功获取的 item
     const results = await Promise.all(
       recentItems.map(async (item) => {
         const filename = await fetchFilenameWithCache(item.link, cache, ctx)
@@ -210,8 +271,8 @@ export default {
     )
     const processedItems = results.filter((item): item is RSSItem => item !== null)
 
-    // 5. 生成 XML（只包含成功解析的 item）
-    const outputXml = buildRssXml(rssObj.rss.channel, processedItems, request.url)
+    // 4. 生成 XML（只包含成功解析的 item）
+    const outputXml = buildRssXml(channel, processedItems, request.url)
 
     return new Response(outputXml, {
       headers: { 'Content-Type': 'application/xml; charset=utf-8' },
@@ -219,33 +280,41 @@ export default {
   },
 } satisfies ExportedHandler
 
-// 爬虫逻辑
+// 爬虫逻辑（使用 HTMLRewriter 流式解析）
 async function fetchFilenameFromPage(url: string): Promise<{ filename: string | null; skipMarker: SkipReason | null }> {
   const resp = await fetch(url, {
     headers: { 'User-Agent': USER_AGENT },
   })
   if (!resp.ok) return { filename: null, skipMarker: SkipReason.HttpError }
-  const html = await resp.text()
 
-  const { document } = parseHTML(html)
+  let listCount = 0
+  let isTargetLi = false
+  let rawText = ''
 
-  // 找到 file_list 容器
-  const fileList = document.querySelector('.file_list')
-  if (!fileList) return { filename: null, skipMarker: SkipReason.NoFileList }
+  const rewriter = new HTMLRewriter()
+    .on('.file_list li', {
+      element() {
+        listCount++
+        if (listCount === 1) isTargetLi = true
+      },
+      text(text) {
+        if (isTargetLi) {
+          rawText += text.text
+        }
+      },
+    })
+    .on('.file_list li .bt_file_size', {
+      element(el) {
+        el.remove()
+      },
+    })
 
-  // 获取所有 li 元素
-  const listItems = fileList.querySelectorAll('li')
+  await rewriter.transform(resp).text()
 
-  // 只处理单文件种子
-  if (listItems.length !== 1) return { filename: null, skipMarker: SkipReason.NotSingleFile }
+  if (listCount === 0) return { filename: null, skipMarker: SkipReason.NoFileList }
+  if (listCount !== 1) return { filename: null, skipMarker: SkipReason.NotSingleFile }
 
-  const li = listItems[0]
-  // 获取 li 的文本内容，排除 span（文件大小）
-  const sizeSpan = li.querySelector('.bt_file_size')
-  if (sizeSpan) sizeSpan.remove()
-
-  const text = li.textContent?.trim() || ''
-  // 取路径的最后一部分作为文件名
+  const text = rawText.trim()
   const filename = text.split('/').pop()?.trim() || ''
 
   return { filename: filename || null, skipMarker: filename ? null : SkipReason.NoFileList }
